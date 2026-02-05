@@ -71,7 +71,28 @@ ros2 topic pub --once /right_arm/target_pose geometry_msgs/msg/PoseStamped '{
 }'
 ```
 
-### 3. 订阅末端位姿反馈
+### 3. 使用增量控制（相对末端坐标系，更直观！）
+
+**这是推荐的控制方式**，增量是相对于末端坐标系的：
+
+```bash
+# 沿末端 Z 轴（向上）移动 5cm
+python3 test_delta_control.py left 0 0 0.05
+
+# 沿末端 X 轴（前方）移动 3cm
+python3 test_delta_control.py right 0.03 0 0
+
+# 沿末端 Z 轴上下往复运动
+python3 test_delta_control.py left 0 0 0.05  # 上
+python3 test_delta_control.py left 0 0 -0.05  # 下
+```
+
+坐标系说明（相对末端）：
+- **X 轴**: 末端前方
+- **Y 轴**: 末端左侧
+- **Z 轴**: 末端上方
+
+### 4. 订阅末端位姿反馈
 
 ```bash
 # 查看左臂末端位姿（100Hz）
@@ -91,8 +112,10 @@ ros2 topic hz /left_arm/ee_pose
 | 话题名称 | 消息类型 | 说明 |
 |---------|---------|------|
 | `/joint_states` | `sensor_msgs/JointState` | 机器人关节状态 |
-| `/left_arm/target_pose` | `geometry_msgs/PoseStamped` | 左臂目标位姿 |
-| `/right_arm/target_pose` | `geometry_msgs/PoseStamped` | 右臂目标位姿 |
+| `/left_arm/target_pose` | `geometry_msgs/PoseStamped` | 左臂目标位姿（基座坐标系） |
+| `/right_arm/target_pose` | `geometry_msgs/PoseStamped` | 右臂目标位姿（基座坐标系） |
+| `/left_arm/delta_pose` | `geometry_msgs/Twist` | 左臂增量控制（末端坐标系）⭐ |
+| `/right_arm/delta_pose` | `geometry_msgs/Twist` | 右臂增量控制（末端坐标系）⭐ |
 
 ### 发布的话题
 

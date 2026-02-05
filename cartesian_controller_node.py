@@ -15,7 +15,7 @@ from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion
+from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion, Twist
 from std_msgs.msg import Header
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -156,13 +156,15 @@ class ArmController:
             rotation = Rotation.from_quat(orientation)  # [x, y, z, w]
             target_orientation = rotation.as_matrix()
         
-        # 逆运动学求解
+        # 逆运动学求解 - 添加更宽松的约束
         try:
             target_joints_full = self.chain.inverse_kinematics(
                 target_position=position,
                 target_orientation=target_orientation,
                 orientation_mode=orientation_mode,
-                initial_position=initial_position
+                initial_position=initial_position,
+                # 添加优化参数，提高求解成功率
+                **{'max_iter': 1000}  # 增加迭代次数
             )
         except Exception as e:
             self.node.get_logger().error(f"[{self.arm}] IK 求解失败: {e}")
@@ -179,7 +181,7 @@ class ArmController:
         joint_positions: List[float],
         duration_sec: float
     ) -> bool:
-        """发送关节轨迹"""
+        """发送关节轨迹（异步非阻塞）"""
         goal_msg = FollowJointTrajectory.Goal()
         goal_msg.trajectory.joint_names = self.joint_names
         
@@ -188,23 +190,39 @@ class ArmController:
         point.time_from_start = Duration(sec=int(duration_sec), nanosec=0)
         goal_msg.trajectory.points.append(point)
         
-        # 发送 goal
-        send_goal_future = self._action_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self.node, send_goal_future, timeout_sec=2.0)
-        
-        if not send_goal_future.done():
-            self.node.get_logger().error(f"[{self.arm}] 发送目标超时")
-            return False
-        
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
-            self.node.get_logger().error(f"[{self.arm}] 目标被拒绝")
-            return False
-        
+        # 异步发送 goal（不等待结果）
         self.node.get_logger().info(
-            f"[{self.arm}] 目标已接受: {[f'{x:.3f}' for x in joint_positions]}"
+            f"[{self.arm}] 发送关节目标: {[f'{x:.3f}' for x in joint_positions]}"
         )
+        
+        send_goal_future = self._action_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self._goal_response_callback)
+        
         return True
+    
+    def _goal_response_callback(self, future):
+        """Goal 响应回调"""
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.node.get_logger().error(f"[{self.arm}] 目标被拒绝!")
+                return
+            
+            self.node.get_logger().info(f"[{self.arm}] 目标已接受，开始执行")
+            
+            # 获取结果（异步）
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(self._get_result_callback)
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.arm}] Goal 响应错误: {e}")
+    
+    def _get_result_callback(self, future):
+        """结果回调"""
+        try:
+            result = future.result().result
+            self.node.get_logger().info(f"[{self.arm}] 执行完成! 错误码: {result.error_code}")
+        except Exception as e:
+            self.node.get_logger().error(f"[{self.arm}] 获取结果错误: {e}")
 
 
 class CartesianControllerNode(Node):
@@ -244,12 +262,19 @@ class CartesianControllerNode(Node):
             qos_profile
         )
         
-        # 订阅控制命令（PoseStamped - xyz + quaternion）
+        # 订阅控制命令（PoseStamped - xyz + quaternion，基座坐标系）
         if self.enable_left:
             self.left_pose_sub = self.create_subscription(
                 PoseStamped,
                 '/left_arm/target_pose',
                 lambda msg: self._pose_command_callback(msg, 'left'),
+                10
+            )
+            # 订阅增量控制命令（Twist - 相对末端坐标系）
+            self.left_delta_sub = self.create_subscription(
+                Twist,
+                '/left_arm/delta_pose',
+                lambda msg: self._delta_command_callback(msg, 'left'),
                 10
             )
         
@@ -258,6 +283,13 @@ class CartesianControllerNode(Node):
                 PoseStamped,
                 '/right_arm/target_pose',
                 lambda msg: self._pose_command_callback(msg, 'right'),
+                10
+            )
+            # 订阅增量控制命令（Twist - 相对末端坐标系）
+            self.right_delta_sub = self.create_subscription(
+                Twist,
+                '/right_arm/delta_pose',
+                lambda msg: self._delta_command_callback(msg, 'right'),
                 10
             )
         
@@ -355,6 +387,47 @@ class CartesianControllerNode(Node):
         
         # 执行运动
         controller.move_to_pose(position, orientation, orientation_mode='all')
+    
+    def _delta_command_callback(self, msg: Twist, arm: str) -> None:
+        """增量控制回调（相对末端坐标系）"""
+        if arm not in self.controllers:
+            return
+        
+        controller = self.controllers[arm]
+        
+        # 获取当前末端位姿
+        pose_data = controller.get_end_effector_pose()
+        if pose_data is None:
+            self.get_logger().warn(f"[{arm}] 无法获取当前末端位姿")
+            return
+        
+        current_pos, current_quat = pose_data
+        
+        # 提取增量（linear 是位置增量，angular 是姿态增量）
+        delta_pos = np.array([msg.linear.x, msg.linear.y, msg.linear.z])
+        delta_rpy = np.array([msg.angular.x, msg.angular.y, msg.angular.z])
+        
+        # 将增量从末端坐标系转换到基座坐标系
+        current_rot = Rotation.from_quat(current_quat)
+        delta_pos_base = current_rot.apply(delta_pos)
+        
+        # 计算新的目标位置
+        target_pos = current_pos + delta_pos_base
+        
+        # 计算新的目标姿态
+        delta_rot = Rotation.from_euler('xyz', delta_rpy)
+        target_rot = current_rot * delta_rot
+        target_quat = target_rot.as_quat()
+        
+        self.get_logger().info(
+            f"[{arm}] 收到增量: delta_pos=[{delta_pos[0]:.3f}, {delta_pos[1]:.3f}, {delta_pos[2]:.3f}]"
+        )
+        self.get_logger().info(
+            f"[{arm}] 目标位置: pos=[{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]"
+        )
+        
+        # 执行运动
+        controller.move_to_pose(target_pos.tolist(), target_quat.tolist(), orientation_mode='all')
     
     def _publish_ee_poses(self) -> None:
         """发布末端位姿（100Hz）"""
